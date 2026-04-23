@@ -252,9 +252,9 @@ deinit :: (using server: *Server) {
 
     deinit(*wait_group);
 
-    close_and_reset(*socket);
-    close_and_reset(*request_step_done_read_handle);
-    close_and_reset(*request_step_done_write_handle);
+    _close_socket_s32(*socket);
+    _close_socket_s32(*request_step_done_read_handle);
+    _close_socket_s32(*request_step_done_write_handle);
 }
 
 start :: (server: *Server, port: u16, num_threads: s32 = 10) -> bool {
@@ -276,7 +276,7 @@ start :: (server: *Server, port: u16, num_threads: s32 = 10) -> bool {
         }
     } else {
         // @ToDo: optionally restrict interface
-        server.socket = socket(AF_INET6, .STREAM, 0);
+        server.socket = xx socket(AF_INET6, .STREAM, 0);
         if server.socket == HANDLE_INVALID {
             error_code := get_last_socket_error();
             error_string := System.get_error_string(error_code);
@@ -286,7 +286,7 @@ start :: (server: *Server, port: u16, num_threads: s32 = 10) -> bool {
 
         one: s32 = 1;
         zero: s32 = 0;
-        result = setsockopt(server.socket, SOL_SOCKET, SO_REUSEADDR, *one, size_of(type_of(one)));
+        result = setsockopt(xx server.socket, SOL_SOCKET, SO_REUSEADDR, cast(*u8)*one, size_of(type_of(one)));
         if result == -1 {
             error_code := get_last_socket_error();
             error_string := System.get_error_string(error_code);
@@ -295,10 +295,14 @@ start :: (server: *Server, port: u16, num_threads: s32 = 10) -> bool {
             return false;
         }
 
-        #if OS == .MACOS {
-            result = setsockopt(server.socket, cast(s32) IPPROTO.IPV6, IPV6_V6ONLY, *zero, size_of(type_of(zero)));
+        #if OS == .MACOS || OS == .WINDOWS {
+            // On Windows SOL_IPV6 is misdefined in the Socket bindings
+            // (SOL_SOCKET - 5), which setsockopt rejects (WSAEINVAL). The
+            // correct level for V6ONLY is IPPROTO_IPV6 (= 41). macOS uses
+            // the same value via its IPPROTO enum.
+            result = setsockopt(xx server.socket, cast(s32) IPPROTO.IPV6, IPV6_V6ONLY, cast(*u8)*zero, size_of(type_of(zero)));
         } else {
-            result = setsockopt(server.socket, SOL_IPV6, IPV6_V6ONLY, *zero, size_of(type_of(zero)));
+            result = setsockopt(xx server.socket, SOL_IPV6, IPV6_V6ONLY, cast(*u8)*zero, size_of(type_of(zero)));
         }
         if result == -1 {
             error_code := get_last_socket_error();
@@ -309,9 +313,15 @@ start :: (server: *Server, port: u16, num_threads: s32 = 10) -> bool {
         }
 
         address: [16] u8;
-        #assert(size_of(type_of(in6addr_any)) == size_of(type_of(address)));
-        memcpy(address.data, *in6addr_any, size_of(type_of(address)));
-        result = bind(server.socket, address, port);
+        #if OS == .WINDOWS {
+            // in6addr_any isn't exported in our Windows Socket bindings; it's
+            // defined as IN6ADDR_ANY_INIT which is 16 zero bytes.
+            // `address` is already zero-initialized.
+        } else {
+            #assert(size_of(type_of(in6addr_any)) == size_of(type_of(address)));
+            memcpy(address.data, *in6addr_any, size_of(type_of(address)));
+        }
+        result = bind(xx server.socket, address, port);
         if result == -1 {
             error_code := get_last_socket_error();
             error_string := System.get_error_string(error_code);
@@ -320,7 +330,7 @@ start :: (server: *Server, port: u16, num_threads: s32 = 10) -> bool {
             return false;
         }
 
-        result = listen(server.socket, SOMAXCONN);
+        result = listen(xx server.socket, SOMAXCONN);
         if result == -1 {
             error_code := get_last_socket_error();
             error_string := System.get_error_string(error_code);
@@ -330,7 +340,7 @@ start :: (server: *Server, port: u16, num_threads: s32 = 10) -> bool {
         }
     }
 
-    success := set_blocking(server.socket, false);
+    success := set_blocking(xx server.socket, false);
     if !success {
         error_code := get_last_socket_error();
         error_string := System.get_error_string(error_code);
@@ -351,16 +361,13 @@ start :: (server: *Server, port: u16, num_threads: s32 = 10) -> bool {
         return false;
     }
 
-    worker_pipes:          [2] s32;
-    result = pipe(*worker_pipes);
-    if result != 0 {
-        error_code, error_string := System.get_error_value_and_string();
-        log_error("Could not create worker pipe: % %", error_code, error_string);
+    rh, wh, pipe_ok := _make_worker_pipe();
+    if !pipe_ok {
+        log_error("Could not create worker pipe");
         return false;
     }
-
-    server.request_step_done_read_handle  = worker_pipes[0];
-    server.request_step_done_write_handle = worker_pipes[1];
+    server.request_step_done_read_handle  = rh;
+    server.request_step_done_write_handle = wh;
 
     success = add_handles(*server.wait_group, server, handle_request_step_done_event, server.request_step_done_read_handle);
     if !success {
@@ -368,20 +375,32 @@ start :: (server: *Server, port: u16, num_threads: s32 = 10) -> bool {
         return false;
     }
 
-    // Instead of ignoring, we have to define a no-op signal handler because SIG_IGN is inherited by child processes, but signal handlers are not.
-    // WTF, fork(), really?!?!
-    ignore_signal :: (signal: s32) #c_call {}
-    sa: sigaction_t;
-    sa.sa_handler = ignore_signal;
-    sigemptyset(*sa.sa_mask);
-    sa.sa_flags = SA_ONSTACK | SA_RESTART;
-    sigaction(SIGINT, *sa, null);  // Stop
-    sigaction(SIGTERM, *sa, null); // Stop
+    #if OS != .WINDOWS {
+        // Instead of ignoring, we have to define a no-op signal handler because SIG_IGN is inherited by child processes, but signal handlers are not.
+        // WTF, fork(), really?!?!
+        ignore_signal :: (signal: s32) #c_call {}
+        sa: sigaction_t;
+        sa.sa_handler = ignore_signal;
+        sigemptyset(*sa.sa_mask);
+        sa.sa_flags = SA_ONSTACK | SA_RESTART;
+        sigaction(SIGINT, *sa, null);  // Stop
+        sigaction(SIGTERM, *sa, null); // Stop
 
-    success = add_signals(*server.wait_group, server, handle_signal_event, SIGINT, SIGTERM);
-    if !success {
-        deinit(server);
-        return false;
+        success = add_signals(*server.wait_group, server, handle_signal_event, SIGINT, SIGTERM);
+        if !success {
+            deinit(server);
+            return false;
+        }
+    } else {
+        // On Windows wait_group's add_signals installs a SetConsoleCtrlHandler
+        // that synthesizes matching SIGINT/SIGTERM values.
+        SIGINT_W  :: 2;
+        SIGTERM_W :: 15;
+        success = add_signals(*server.wait_group, server, handle_signal_event, SIGINT_W, SIGTERM_W);
+        if !success {
+            deinit(server);
+            return false;
+        }
     }
 
 
@@ -408,8 +427,73 @@ stop :: (using server: *Server, graceful := true) {
         if !success {
             log_error("Could not remove server socket from wait group");
         }
-        close_and_reset(*server.socket);
+        _close_socket_s32(*server.socket);
     }
+}
+
+// hyperserve tracks sockets as s32 everywhere, but Socket.close_and_reset
+// takes *Socket — s32 on POSIX, *u64/SOCKET on Windows. Bridge here so the
+// callers don't sprinkle casts. Pointer reinterpret is safe because we
+// always store socket handles that fit in s32 in practice (Winsock uses
+// small ints) and writing -1 is compatible with both INVALID_SOCKET forms.
+_close_socket_s32 :: (fd: *s32) {
+    #if OS == .WINDOWS {
+        if fd.* != -1 {
+            closesocket(cast(Socket) fd.*);
+            fd.* = -1;
+        }
+    } else {
+        close_and_reset(fd);
+    }
+}
+
+// Worker wakeup "pipe": pipe() on POSIX, UDP loopback socket pair on Windows.
+// Read/write are single-byte signals only — payload is discarded.
+_make_worker_pipe :: () -> read_handle: s32, write_handle: s32, success: bool {
+    #if OS == .WINDOWS {
+        recv_sock := socket(AF_INET, .DGRAM, 0);
+        if recv_sock == INVALID_SOCKET  return -1, -1, false;
+        if bind(recv_sock, "127.0.0.1", 0) == -1 {
+            closesocket(recv_sock);
+            return -1, -1, false;
+        }
+        addr: sockaddr_in;
+        addr_len: s32 = size_of(sockaddr_in);
+        if getsockname(recv_sock, cast(*sockaddr)*addr, *addr_len) == -1 {
+            closesocket(recv_sock);
+            return -1, -1, false;
+        }
+        if !set_blocking(recv_sock, false) {
+            closesocket(recv_sock);
+            return -1, -1, false;
+        }
+        send_sock := socket(AF_INET, .DGRAM, 0);
+        if send_sock == INVALID_SOCKET {
+            closesocket(recv_sock);
+            return -1, -1, false;
+        }
+        if connect(send_sock, cast(*sockaddr)*addr, size_of(sockaddr_in)) == -1 {
+            closesocket(recv_sock);
+            closesocket(send_sock);
+            return -1, -1, false;
+        }
+        return cast(s32) recv_sock, cast(s32) send_sock, true;
+    } else {
+        handles: [2] s32;
+        if pipe(*handles) != 0  return -1, -1, false;
+        return handles[0], handles[1], true;
+    }
+}
+
+_worker_pipe_read_byte :: (handle: s32) -> s64 {
+    data: u8;
+    #if OS == .WINDOWS  return recv(xx handle, *data, 1, xx 0);
+    else                return read(handle, *data, 1);
+}
+
+_worker_pipe_write_byte :: (handle: s32, data: u8) -> s64 {
+    #if OS == .WINDOWS  return send(xx handle, *data, 1, xx 0);
+    else                return write(handle, *data, 1);
 }
 
 Status_Code :: enum u16 {
@@ -475,7 +559,8 @@ redirect :: (target_url: string, status_code := Status_Code.SEE_OTHER) {
 
 // :ResponseHeaderValues:
 respond :: (response := "", status_code := Status_Code.AUTO, content_type := "text/plain", headers: [] Response_Header = .[]) {
-    respond(cast([] u8) response, status_code, content_type);
+    // Forward the `headers` arg to the []u8 overload — upstream dropped it here.
+    respond(cast([] u8) response, status_code, content_type, headers);
 }
 
 // :ResponseHeaderValues:
@@ -649,10 +734,12 @@ can_send_data_event :: (group: *Wait_Group, handle: s32, is_eof: bool, event_typ
         data := get_buffer_data(task.current_response_buffer) + task.current_response_buffer_offset;
         remaining := task.current_response_buffer.count - task.current_response_buffer_offset;
         while remaining {
-            result := send(socket, data, cast(u64) remaining, flags);
+            // Winsock's send() takes SOCKET (u64) + s32 length, POSIX takes s32 fd + u64 length.
+            // `xx` lets the compiler pick per-platform conversions.
+            result: s64 = send(xx socket, data, xx remaining, flags);
             if result == -1 {
                 error_code := get_last_socket_error();
-                if error_code == EAGAIN || error_code == EWOULDBLOCK {
+                if error_code == SOCKET_WOULDBLOCK {
                     return; // Wait until we’re called again, when there’s more room.
                 }
 
@@ -812,15 +899,18 @@ get_reason_string :: (code: Status_Code) -> string {
 }
 
 handle_signal_event :: (group: *Wait_Group, signal: s32, server: *Server) {
-    if signal == {
-        case SIGINT; #through;
-        case SIGQUIT; #through;
-        case SIGTERM;
-            log("Caught signal %. Shutting down…", signal);
-            stop(server, graceful = (server.state == .STARTED));
-        case;
-            log("Caught unexpected signal: %", signal);
-            assert(false);
+    // POSIX signal numbers used across both real-POSIX and the Windows
+    // SetConsoleCtrlHandler → signal mapping that wait_group/windows.jai
+    // synthesizes. SIGINT=2, SIGQUIT=3, SIGTERM=15.
+    SIGINT_NUM  :: 2;
+    SIGQUIT_NUM :: 3;
+    SIGTERM_NUM :: 15;
+    if signal == SIGINT_NUM || signal == SIGQUIT_NUM || signal == SIGTERM_NUM {
+        log("Caught signal %. Shutting down…", signal);
+        stop(server, graceful = (server.state == .STARTED));
+    } else {
+        log("Caught unexpected signal: %", signal);
+        assert(false);
     }
 }
 
@@ -839,7 +929,8 @@ handle_connect_event :: (group: *Wait_Group, handle: s32, is_eof: bool, event_ty
     #if USE_CLUSTER {
         client_socket, client_addr := cluster_accept(.IPV6, server.socket);
     } else {
-        client_socket, client_sock_addr := accept_v6(server.socket);
+        client_socket_raw, client_sock_addr := accept_v6(xx server.socket);
+        client_socket: s32 = xx client_socket_raw;
         client_addr := socket_address(client_sock_addr);
     }
     if client_socket == HANDLE_INVALID {
@@ -848,28 +939,28 @@ handle_connect_event :: (group: *Wait_Group, handle: s32, is_eof: bool, event_ty
         return;
     }
 
-    success := set_keepalive(client_socket, true, idle_seconds_before_keepalive = 10, keepalive_interval_seconds = 5, num_keepalive_attempts = 4);
+    success := set_keepalive(xx client_socket, true, idle_seconds_before_keepalive = 10, keepalive_interval_seconds = 5, num_keepalive_attempts = 4);
     if !success {
         error_code, error_string := System.get_error_value_and_string();
         log_error("Couldn’t set client socket keepalive: % %", error_code, error_string);
-        close(client_socket);
+        _close_socket_s32(*client_socket);
         return;
     }
 
-    success = set_blocking(client_socket, false);
+    success = set_blocking(xx client_socket, false);
     if !success {
         error_code, error_string := System.get_error_value_and_string();
         log_error("Couldn’t set client socket to non-blocking: % %", error_code, error_string);
-        close(client_socket);
+        _close_socket_s32(*client_socket);
         return;
     }
     #if OS == .MACOS {
         set: s32 = 1;
-        result := setsockopt(client_socket, SOL_SOCKET, SO_NOSIGPIPE, *set, size_of(type_of(set)));
+        result := setsockopt(client_socket, SOL_SOCKET, SO_NOSIGPIPE, cast(*u8)*set, size_of(type_of(set)));
         if result == -1 {
             error_value, error_string := System.get_error_value_and_string();
             log_error("Could not set socket options: % %", error_value, error_string);
-            close(client_socket);
+            _close_socket_s32(*client_socket);
             return;
         }
     }
@@ -907,8 +998,7 @@ handle_request_step_done_event :: (group: *Wait_Group, handle: s32, is_eof: bool
     completed_work := get_completed_work(*server.request_thread_group);
     for work: completed_work {
         // @Speed, @ToDo: Read completed_work.count bytes ouside the loop instead
-        data: u8;
-        result := repeat_if_interrupted(read(server.request_step_done_read_handle, *data, 1));
+        result := _worker_pipe_read_byte(server.request_step_done_read_handle);
         if result == -1 {
             error_code, error_string := System.get_error_value_and_string();
             log_error("Could not read from pipe: % %", error_code, error_string);
@@ -1033,7 +1123,7 @@ remove_client :: (server: *Server, client: *Client) -> success: bool {
 }
 
 deinit :: (client: *Client) {
-    close_and_reset(*client.socket);
+    _close_socket_s32(*client.socket);
     release(client.request_pool);
     free(client.request_pool);
 }
@@ -1247,8 +1337,7 @@ thread_handle_request :: (group: *Thread_Group, thread: *Thread, work: *void) ->
         log("%: (%) % % -> % % (%ms%)", now_string, request.id, request.method, request.url, cast(int) request.response_status_code, request.response_status_code, formatFloat(request_duration_microseconds / 1000.0, trailing_width = 2, zero_removal = .NO), suffix);
     }
 
-    data: u8 = 1;
-    result := repeat_if_interrupted(write(server.request_step_done_write_handle, *data, 1));
+    result := _worker_pipe_write_byte(server.request_step_done_write_handle, 1);
     if result == -1 {
         error_code, error_string := System.get_error_value_and_string();
         log_error("Could not write to pipe: % %", error_code, error_string);
@@ -1437,8 +1526,10 @@ find_route_and_parse_parameters :: (request: *Request) {
         return;
     }
 
-    assert(request.method == .GET, "Non-GET requests are not implemented yet!"); // @Incomplete
-    // @ToDo: Wait for the remaining body and maybe parse it for non-GET requests :HandleBody:
+    // Non-GET routing: pending_body already contains whatever arrived alongside
+    // the headers. For small bodies (MCP's JSON-RPC payloads are O(KB)) this is
+    // the entire body in one shot. For larger bodies we'd still need the
+    // `:HandleBody:` loop to grow the buffer — out of scope here.
 
     found, path, remainder := split_from_left(request.target, #char "?");
     request.path = path;
@@ -1803,10 +1894,10 @@ read_handle :: (handle: s32, buffer: [] u8) -> success: bool, bytes_read: int {
     #if OS == .LINUX {
         flags |= .NOSIGNAL;
     }
-    bytes_read := recv(handle, buffer.data, cast(u64) buffer.count, flags);
+    bytes_read: s64 = recv(xx handle, buffer.data, xx buffer.count, flags);
     if bytes_read < 0 {
-        read_error := errno();
-        if read_error == EAGAIN || read_error == EWOULDBLOCK {
+        read_error := get_last_socket_error();
+        if read_error == SOCKET_WOULDBLOCK {
             return true, 0;
         }
 
@@ -1822,9 +1913,14 @@ repeat_if_interrupted :: (call: Code) -> s64 #expand {
         result := #insert call;
         if result == -1 {
             error_code := System.get_error_value();
-            if error_code == EINTR || error_code == EAGAIN {
-                // Got interrupted, try again.
-                continue;
+            #if OS == .WINDOWS {
+                // No EINTR on Windows; WSAPoll and Winsock calls either
+                // succeed or fail outright. Don't retry.
+                return result;
+            } else {
+                if error_code == EINTR || error_code == EAGAIN {
+                    continue;
+                }
             }
         }
         return result;
