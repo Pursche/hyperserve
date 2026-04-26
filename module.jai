@@ -250,6 +250,17 @@ deinit :: (using server: *Server) {
         remove_client(server, it);
     }
 
+    // remove_client only frees per-client state and the slot inside the
+    // Bucket_Array; the Bucket_Array itself still holds its bucket pages.
+    // bucket_array_reset frees those pages and the array's two backing arrays.
+    bucket_array_reset(*clients);
+
+    // Yielded-request bookkeeping: in-flight requests that haven't resumed
+    // before shutdown leave their pointers parked here. Free the backing
+    // array; the Request structs themselves are pool-allocated under their
+    // owning Client, which we just freed via remove_client above.
+    array_reset(*requests_that_have_yielded);
+
     deinit(*wait_group);
 
     _close_socket_s32(*socket);
