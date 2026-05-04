@@ -81,6 +81,13 @@
 HANDLE_INVALID     :: -1;
 
 RECEIVE_HEADER_TIMEOUT_MS :: 30_000; // ToDo: Make this configurable
+
+// Bounded grace window for stop(graceful=true). After this many ms in
+// STOPPING state, update() force-closes any remaining clients instead of
+// waiting for their per-request 30 s receive-header timeout. Caps the
+// worst-case shutdown when a handler leaks an SSE client (or a real SSE
+// peer is unresponsive).
+SHUTDOWN_DRAIN_TIMEOUT_MS :: 2_000;
 RECEIVE_BODY_TIMEOUT_MS   :: 30_000; // ToDo: Make this configurable
 SEND_TIMEOUT_MS           :: 30_000; // ToDo: Make this configurable
 
@@ -121,6 +128,11 @@ Server :: struct {
     request_completed_callback: #type (timestamp: Apollo_Time, duration_us: s64, request: *Request);
 
     open_connections:           int;
+
+    // Set when stop(graceful=true) transitions us into STOPPING. update()
+    // uses it to bound the drain wait at SHUTDOWN_DRAIN_TIMEOUT_MS before
+    // force-closing remaining clients.
+    stopping_started_at:        Apollo_Time = APOLLO_TIME_INVALID;
 
     requests_that_have_yielded: [..] *Request; // Just for debugging, for now
 }
@@ -424,6 +436,7 @@ start :: (server: *Server, port: u16, num_threads: s32 = 10) -> bool {
 stop :: (using server: *Server, graceful := true) {
     if graceful && server.state == .STARTED {
         server.state = .STOPPING;
+        server.stopping_started_at = current_time_monotonic();
     } else {
         server.state = .STOPPED;
     }
@@ -557,7 +570,31 @@ update :: (using server: *Server) -> bool {
             log("No more open connections during shutdown. Server has stopped.");
             state = .STOPPED;
         } else {
-            log("Waiting for % open connections to close…", open_connections);
+            // Bounded drain: most clients are reaped naturally as their
+            // in-flight request returns and the completion path sees
+            // remove_after_request. But anything orphaned (e.g. a lingering
+            // SSE handler that never called close_event_stream, or a real
+            // SSE peer that's hung) won't ever wake up — its socket is out
+            // of the wait_group and its receive timer has been removed.
+            // Force-close after SHUTDOWN_DRAIN_TIMEOUT_MS so shutdown can't
+            // hang on the OS-level TCP timeout per zombie.
+            elapsed_us := to_microseconds(current_time_monotonic() - stopping_started_at);
+            if elapsed_us > SHUTDOWN_DRAIN_TIMEOUT_MS * 1000 {
+                log("Drain timeout (% ms) exceeded with % connection(s) still open; force-closing.",
+                    SHUTDOWN_DRAIN_TIMEOUT_MS, open_connections);
+                while open_connections > 0 {
+                    found := false;
+                    for * server.clients {
+                        remove_client(server, it);
+                        found = true;
+                        break;
+                    }
+                    if !found break;   // Defensive: avoid infinite loop if the counter ever desyncs.
+                }
+                state = .STOPPED;
+            } else {
+                log("Waiting for % open connections to close…", open_connections);
+            }
         }
     }
 
@@ -1038,8 +1075,13 @@ handle_request_step_done_event :: (group: *Wait_Group, handle: s32, is_eof: bool
                 // (We might start dropping new connect requests if the main thread is too busy.)
                 begin(task, *server.wait_group, request, on_request_async_task_complete);
             }
-        } else if !request.is_event_stream {
-            // Request is complete
+        } else if !request.is_event_stream || client.remove_after_request {
+            // Request is complete (or the server is shutting down — even
+            // a still-open event stream must be torn down on STOPPING so
+            // stop()'s open_connections drain can complete; otherwise an
+            // SSE handler that never calls close_event_stream leaves its
+            // client in server.clients with no wait_group registration,
+            // and shutdown waits forever).
             if client.received_eof || client.remove_after_request {
                 if server.verbose log("Removing client % after request % (eof: % / remove after request: %)", client.name, request.id, client.received_eof, client.remove_after_request);
                 remove_client(server, client);
