@@ -299,7 +299,7 @@ start :: (server: *Server, port: u16, num_threads: s32 = 10) -> bool {
         }
     } else {
         // @ToDo: optionally restrict interface
-        server.socket = xx socket(AF_INET6, .STREAM, 0);
+        server.socket = _socket_to_s32(socket(AF_INET6, .STREAM, 0));
         if server.socket == HANDLE_INVALID {
             error_code := get_last_socket_error();
             error_string := System.get_error_string(error_code);
@@ -309,7 +309,7 @@ start :: (server: *Server, port: u16, num_threads: s32 = 10) -> bool {
 
         one: s32 = 1;
         zero: s32 = 0;
-        result = setsockopt(xx server.socket, SOL_SOCKET, SO_REUSEADDR, cast(*u8)*one, size_of(type_of(one)));
+        result = setsockopt(_s32_to_socket(server.socket), SOL_SOCKET, SO_REUSEADDR, cast(*u8)*one, size_of(type_of(one)));
         if result == -1 {
             error_code := get_last_socket_error();
             error_string := System.get_error_string(error_code);
@@ -323,9 +323,9 @@ start :: (server: *Server, port: u16, num_threads: s32 = 10) -> bool {
             // (SOL_SOCKET - 5), which setsockopt rejects (WSAEINVAL). The
             // correct level for V6ONLY is IPPROTO_IPV6 (= 41). macOS uses
             // the same value via its IPPROTO enum.
-            result = setsockopt(xx server.socket, cast(s32) IPPROTO.IPV6, IPV6_V6ONLY, cast(*u8)*zero, size_of(type_of(zero)));
+            result = setsockopt(_s32_to_socket(server.socket), cast(s32) IPPROTO.IPV6, IPV6_V6ONLY, cast(*u8)*zero, size_of(type_of(zero)));
         } else {
-            result = setsockopt(xx server.socket, SOL_IPV6, IPV6_V6ONLY, cast(*u8)*zero, size_of(type_of(zero)));
+            result = setsockopt(_s32_to_socket(server.socket), SOL_IPV6, IPV6_V6ONLY, cast(*u8)*zero, size_of(type_of(zero)));
         }
         if result == -1 {
             error_code := get_last_socket_error();
@@ -344,7 +344,7 @@ start :: (server: *Server, port: u16, num_threads: s32 = 10) -> bool {
             #assert(size_of(type_of(in6addr_any)) == size_of(type_of(address)));
             memcpy(address.data, *in6addr_any, size_of(type_of(address)));
         }
-        result = bind(xx server.socket, address, port);
+        result = bind(_s32_to_socket(server.socket), address, port);
         if result == -1 {
             error_code := get_last_socket_error();
             error_string := System.get_error_string(error_code);
@@ -353,7 +353,7 @@ start :: (server: *Server, port: u16, num_threads: s32 = 10) -> bool {
             return false;
         }
 
-        result = listen(xx server.socket, SOMAXCONN);
+        result = listen(_s32_to_socket(server.socket), SOMAXCONN);
         if result == -1 {
             error_code := get_last_socket_error();
             error_string := System.get_error_string(error_code);
@@ -363,7 +363,7 @@ start :: (server: *Server, port: u16, num_threads: s32 = 10) -> bool {
         }
     }
 
-    success := set_blocking(xx server.socket, false);
+    success := set_blocking(_s32_to_socket(server.socket), false);
     if !success {
         error_code := get_last_socket_error();
         error_string := System.get_error_string(error_code);
@@ -457,13 +457,19 @@ stop :: (using server: *Server, graceful := true) {
 
 // hyperserve tracks sockets as s32 everywhere, but Socket.close_and_reset
 // takes *Socket — s32 on POSIX, *u64/SOCKET on Windows. Bridge here so the
-// callers don't sprinkle casts. Pointer reinterpret is safe because we
-// always store socket handles that fit in s32 in practice (Winsock uses
-// small ints) and writing -1 is compatible with both INVALID_SOCKET forms.
+// callers don't sprinkle casts. On Windows, the s32 store is bit-preserving:
+// `_socket_to_s32` truncates without sign-extension at store time, and
+// `_s32_to_socket` zero-extends on retrieval, so SOCKET handles above
+// 0x7FFFFFFF (which a long-running proxy can see after many connections)
+// round-trip exactly. Pre-fix, the implicit sign-extend on `cast(Socket)
+// fd.*` for a negative-looking s32 produced 0xFFFFFFFF_xxxxxxxx and any
+// Winsock call on that handle either silently failed or, via WSAPoll's
+// pollfd-rebuild path, surfaced as a __cast_bounds_check_fail crash deep
+// in wait_for_events.
 _close_socket_s32 :: (fd: *s32) {
     #if OS == .WINDOWS {
         if fd.* != -1 {
-            closesocket(cast(Socket) fd.*);
+            closesocket(_s32_to_socket(fd.*));
             fd.* = -1;
         }
     } else {
@@ -501,7 +507,9 @@ _make_worker_pipe :: () -> read_handle: s32, write_handle: s32, success: bool {
             closesocket(send_sock);
             return -1, -1, false;
         }
-        return cast(s32) recv_sock, cast(s32) send_sock, true;
+        // Bit-preserving narrow so a SOCKET >0x7FFFFFFF round-trips safely
+        // through the s32 store. See _socket_to_s32 in wait_group/module.jai.
+        return _socket_to_s32(recv_sock), _socket_to_s32(send_sock), true;
     } else {
         handles: [2] s32;
         if pipe(*handles) != 0  return -1, -1, false;
@@ -511,12 +519,12 @@ _make_worker_pipe :: () -> read_handle: s32, write_handle: s32, success: bool {
 
 _worker_pipe_read_byte :: (handle: s32) -> s64 {
     data: u8;
-    #if OS == .WINDOWS  return recv(xx handle, *data, 1, xx 0);
+    #if OS == .WINDOWS  return recv(_s32_to_socket(handle), *data, 1, xx 0);
     else                return read(handle, *data, 1);
 }
 
 _worker_pipe_write_byte :: (handle: s32, data: u8) -> s64 {
-    #if OS == .WINDOWS  return send(xx handle, *data, 1, xx 0);
+    #if OS == .WINDOWS  return send(_s32_to_socket(handle), *data, 1, xx 0);
     else                return write(handle, *data, 1);
 }
 
@@ -783,8 +791,10 @@ can_send_data_event :: (group: *Wait_Group, handle: s32, is_eof: bool, event_typ
         remaining := task.current_response_buffer.count - task.current_response_buffer_offset;
         while remaining {
             // Winsock's send() takes SOCKET (u64) + s32 length, POSIX takes s32 fd + u64 length.
-            // `xx` lets the compiler pick per-platform conversions.
-            result: s64 = send(xx socket, data, xx remaining, flags);
+            // _s32_to_socket bit-preservingly widens — required on Windows when
+            // the OS hands out SOCKET handles above 0x7FFFFFFF that get stored
+            // as negative s32; plain `xx` sign-extends those to a different u64.
+            result: s64 = send(_s32_to_socket(socket), data, xx remaining, flags);
             if result == -1 {
                 error_code := get_last_socket_error();
                 if error_code == SOCKET_WOULDBLOCK {
@@ -977,8 +987,11 @@ handle_connect_event :: (group: *Wait_Group, handle: s32, is_eof: bool, event_ty
     #if USE_CLUSTER {
         client_socket, client_addr := cluster_accept(.IPV6, server.socket);
     } else {
-        client_socket_raw, client_sock_addr := accept_v6(xx server.socket);
-        client_socket: s32 = xx client_socket_raw;
+        client_socket_raw, client_sock_addr := accept_v6(_s32_to_socket(server.socket));
+        // _socket_to_s32: identity on POSIX, bit-preserving narrow on
+        // Windows so a SOCKET >0x7FFFFFFF round-trips through the s32
+        // store without sign-extension corruption.
+        client_socket: s32 = _socket_to_s32(client_socket_raw);
         client_addr := socket_address(client_sock_addr);
     }
     if client_socket == HANDLE_INVALID {
@@ -987,7 +1000,7 @@ handle_connect_event :: (group: *Wait_Group, handle: s32, is_eof: bool, event_ty
         return;
     }
 
-    success := set_keepalive(xx client_socket, true, idle_seconds_before_keepalive = 10, keepalive_interval_seconds = 5, num_keepalive_attempts = 4);
+    success := set_keepalive(_s32_to_socket(client_socket), true, idle_seconds_before_keepalive = 10, keepalive_interval_seconds = 5, num_keepalive_attempts = 4);
     if !success {
         error_code, error_string := System.get_error_value_and_string();
         log_error("Couldn’t set client socket keepalive: % %", error_code, error_string);
@@ -995,7 +1008,7 @@ handle_connect_event :: (group: *Wait_Group, handle: s32, is_eof: bool, event_ty
         return;
     }
 
-    success = set_blocking(xx client_socket, false);
+    success = set_blocking(_s32_to_socket(client_socket), false);
     if !success {
         error_code, error_string := System.get_error_value_and_string();
         log_error("Couldn’t set client socket to non-blocking: % %", error_code, error_string);
@@ -1947,7 +1960,10 @@ read_handle :: (handle: s32, buffer: [] u8) -> success: bool, bytes_read: int {
     #if OS == .LINUX {
         flags |= .NOSIGNAL;
     }
-    bytes_read: s64 = recv(xx handle, buffer.data, xx buffer.count, flags);
+    // _s32_to_socket: identity on POSIX, zero-extend (via u32) on Windows.
+    // Plain `xx handle` sign-extends a high-SOCKET-store and recv-on-
+    // wrong-handle silently fails.
+    bytes_read: s64 = recv(_s32_to_socket(handle), buffer.data, xx buffer.count, flags);
     if bytes_read < 0 {
         read_error := get_last_socket_error();
         if read_error == SOCKET_WOULDBLOCK {
